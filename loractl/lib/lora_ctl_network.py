@@ -39,29 +39,6 @@ def find_lora_path(name):
                     
     return None
 
-def load_lora_weights(filename):
-    """Load weights from a LoRA file"""
-    print(f"Loading LoRA weights from: {filename}")
-    
-    # First load the raw state dict
-    state_dict = ldm_patched.modules.utils.load_torch_file(filename, safe_load=True)
-    
-    # Split the state dict into CLIP and UNET parts
-    clip_weights = {}
-    unet_weights = {}
-    
-    for key, value in state_dict.items():
-        if key.startswith('lora_te_'):
-            clip_weights[key] = value
-        else:
-            unet_weights[key] = value
-            
-    return {
-        'unet': unet_weights,
-        'clip': clip_weights,
-        'name': os.path.basename(filename)
-    }
-
 class LoraCtlNetwork(extra_networks.ExtraNetwork):
     def __init__(self):
         super().__init__('lora')
@@ -73,7 +50,6 @@ class LoraCtlNetwork(extra_networks.ExtraNetwork):
         if not utils.is_active():
             return super().activate(p, params_list)
 
-        # Store processing object for later use
         self.current_processing = p
 
         for params in params_list:
@@ -92,127 +68,86 @@ class LoraCtlNetwork(extra_networks.ExtraNetwork):
             return
 
         # Store original state for deactivation
-        if not hasattr(current_sd, 'original_unet'):
-            current_sd.original_unet = current_sd.forge_objects.unet
-            current_sd.original_clip = current_sd.forge_objects.clip
+        if not hasattr(current_sd, 'original_network_state'):
+            current_sd.original_network_state = {
+                'unet': current_sd.forge_objects.unet,
+                'clip': current_sd.forge_objects.clip,
+                'lora_names': [],
+                'lora_weights': {}
+            }
 
-        # Reset to original state before applying new weights
-        current_sd.forge_objects.unet = current_sd.original_unet
-        current_sd.forge_objects.clip = current_sd.original_clip
+        names = []
+        unet_weights = []
+        te_weights = []
 
+        # Calculate initial weights for each LoRA
         for name, weights in lora_weights.items():
-            # Find LoRA file
             lora_path = find_lora_path(name)
             if lora_path is None:
                 print(f"LoRA file not found for: {name}")
                 continue
 
-            try:
-                # Load and cache LoRA weights
-                if str(lora_path) not in self.loaded_loras:
-                    self.loaded_loras[str(lora_path)] = load_lora_weights(str(lora_path))
-                lora_data = self.loaded_loras[str(lora_path)]
-                
-                # Calculate initial weights
-                initial_unet_weight = utils.calculate_weight(
-                    weights["unet"],
-                    0,  # initial step
-                    p.steps,
-                    step_offset=2
-                )
-                initial_te_weight = utils.calculate_weight(
-                    weights["te"],
-                    0,  # initial step
-                    p.steps,
-                    step_offset=2
-                )
-                
-                print(f"Initial weights for {name} - UNet: {initial_unet_weight}, TE: {initial_te_weight}")
+            names.append(name)
+            initial_unet_weight = utils.calculate_weight(
+                weights["unet"],
+                0,  # initial step
+                p.steps,
+                step_offset=2
+            )
+            initial_te_weight = utils.calculate_weight(
+                weights["te"],
+                0,  # initial step
+                p.steps,
+                step_offset=2
+            )
+            unet_weights.append(initial_unet_weight)
+            te_weights.append(initial_te_weight)
+            print(f"Initial weights for {name} - UNet: {initial_unet_weight}, TE: {initial_te_weight}")
 
-                # Apply initial weights
-                current_sd.forge_objects.unet, current_sd.forge_objects.clip = ldm_patched.modules.sd.load_lora_for_models(
-                    current_sd.forge_objects.unet,
-                    current_sd.forge_objects.clip,
-                    lora_data['unet'],  # Only pass the UNET weights
-                    initial_unet_weight,
-                    initial_te_weight,
-                    filename=name
-                )
+        # Load networks using the base implementation
+        networks.load_networks(names, te_weights, unet_weights)
 
-            except Exception as e:
-                self.errors[name] = str(e)
-                print(f"Error applying LoRA {name}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
-        # Register callback for the CFGDenoiser
+        # Register callback for weight updates during sampling
         def cfg_callback(params: script_callbacks.CFGDenoiserParams):
             if not lora_weights or not hasattr(self, 'current_processing'):
                 return
 
-            current_sd = self.current_processing.sd_model
             step = params.sampling_step
             total_steps = params.total_sampling_steps
 
-            # Reset to original state before applying new weights
-            current_sd.forge_objects.unet = current_sd.original_unet
-            current_sd.forge_objects.clip = current_sd.original_clip
+            updated_te_weights = []
+            updated_unet_weights = []
 
             for name, weights in lora_weights.items():
-                try:
-                    # Get cached LoRA data
-                    lora_path = find_lora_path(name)
-                    if lora_path is None:
-                        continue
+                current_unet_weight = utils.calculate_weight(
+                    weights["unet"],
+                    step,
+                    total_steps,
+                    step_offset=2
+                )
+                current_te_weight = utils.calculate_weight(
+                    weights["te"],
+                    step,
+                    total_steps,
+                    step_offset=2
+                )
+                updated_unet_weights.append(current_unet_weight)
+                updated_te_weights.append(current_te_weight)
+                print(f"Step {step}/{total_steps} - {name} weights - UNet: {current_unet_weight}, TE: {current_te_weight}")
 
-                    lora_data = self.loaded_loras.get(str(lora_path))
-                    if lora_data is None:
-                        continue
+            # Update network weights
+            networks.load_networks(names, updated_te_weights, updated_unet_weights)
 
-                    # Calculate weights for current step
-                    current_unet_weight = utils.calculate_weight(
-                        weights["unet"],
-                        step,
-                        total_steps,
-                        step_offset=2
-                    )
-                    current_te_weight = utils.calculate_weight(
-                        weights["te"],
-                        step,
-                        total_steps,
-                        step_offset=2
-                    )
-                    
-                    print(f"Step {step}/{total_steps} - {name} weights - UNet: {current_unet_weight}, TE: {current_te_weight}")
-                    
-                    # Apply LoRA with new weights
-                    current_sd.forge_objects.unet, current_sd.forge_objects.clip = ldm_patched.modules.sd.load_lora_for_models(
-                        current_sd.forge_objects.unet,
-                        current_sd.forge_objects.clip,
-                        lora_data['unet'],  # Only pass the UNET weights
-                        current_unet_weight,
-                        current_te_weight,
-                        filename=name
-                    )
-
-                except Exception as e:
-                    print(f"Error updating LoRA {name} at step {step}: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-        # Register the callback
         script_callbacks.on_cfg_denoiser(cfg_callback)
 
     def deactivate(self, p):
         """Reset model state and clear weights after generation"""
-        if hasattr(p, 'sd_model'):
+        if hasattr(p, 'sd_model') and hasattr(p.sd_model, 'original_network_state'):
             current_sd = p.sd_model
-            if hasattr(current_sd, 'original_unet'):
-                current_sd.forge_objects.unet = current_sd.original_unet
-                current_sd.forge_objects.clip = current_sd.original_clip
+            current_sd.forge_objects.unet = current_sd.original_network_state['unet']
+            current_sd.forge_objects.clip = current_sd.original_network_state['clip']
+            delattr(current_sd, 'original_network_state')
         
-        # Clear current processing reference and caches
         self.current_processing = None
         self.loaded_loras.clear()
         
